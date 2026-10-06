@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""Call the Strava API with a stored OAuth credential.
+
+Usage:
+  strava-api athlete
+  strava-api activities [--per-page N] [--page N]
+  strava-api activity <id>
+
+The credential is collected once via the Secure Vault (see SKILL.md) and
+used here through authd's surrogate exchange; this script never sees the
+real access token.
+
+Set STRAVA_CREDENTIAL to use a connector name other than custom.strava.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from dynamic_credentials import (
+    DynamicCredentialError,
+    add_surrogate_to_request,
+    read_json_response,
+)
+
+API_BASE = "https://www.strava.com/api/v3"
+ALLOWED_HOSTS = ["www.strava.com"]
+CREDENTIAL = os.environ.get("STRAVA_CREDENTIAL", "custom.strava")
+
+
+def api_get(path: str, params: dict | None = None):
+    url = API_BASE + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    add_surrogate_to_request(req, CREDENTIAL, allowed_hosts=ALLOWED_HOSTS)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return read_json_response(resp)
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", errors="replace")[:600]
+        except Exception:
+            body = "<unreadable>"
+        raise SystemExit(f"Strava API error: HTTP {exc.code}: {body}")
+    except DynamicCredentialError as exc:
+        raise SystemExit(f"Credential error: {exc}")
+
+
+def cmd_athlete(_args):
+    print(json.dumps(api_get("/athlete"), indent=2))
+
+
+def summarize_activity(a: dict) -> dict:
+    return {
+        "id": a.get("id"),
+        "name": a.get("name"),
+        "type": a.get("type"),
+        "sport_type": a.get("sport_type"),
+        "start_date_local": a.get("start_date_local"),
+        "distance_mi": round(a.get("distance", 0) / 1609.344, 2),
+        "moving_time_min": round(a.get("moving_time", 0) / 60, 1),
+        "average_heartrate": a.get("average_heartrate"),
+        "max_heartrate": a.get("max_heartrate"),
+        "average_speed_mph": round(a.get("average_speed", 0) * 2.23694, 2),
+    }
+
+
+def cmd_activities(args):
+    data = api_get(
+        "/athlete/activities",
+        {"per_page": args.per_page, "page": args.page},
+    )
+    print(json.dumps([summarize_activity(a) for a in data], indent=2))
+
+
+def cmd_activity(args):
+    data = api_get(f"/activities/{args.id}", {"include_all_efforts": "true"})
+    out = summarize_activity(data)
+    out["laps"] = [
+        {
+            "lap_index": lap.get("lap_index"),
+            "name": lap.get("name"),
+            "distance_mi": round(lap.get("distance", 0) / 1609.344, 2),
+            "moving_time_s": lap.get("moving_time"),
+            "average_speed_mph": round(lap.get("average_speed", 0) * 2.23694, 2),
+            "average_heartrate": lap.get("average_heartrate"),
+            "max_heartrate": lap.get("max_heartrate"),
+        }
+        for lap in data.get("laps", [])
+    ]
+    out["lap_count"] = len(out["laps"])
+    print(json.dumps(out, indent=2))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Strava API via Secure Vault")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("athlete", help="Show the authenticated athlete")
+    p.set_defaults(func=cmd_athlete)
+
+    p = sub.add_parser("activities", help="List recent activities")
+    p.add_argument("--per-page", type=int, default=10)
+    p.add_argument("--page", type=int, default=1)
+    p.set_defaults(func=cmd_activities)
+
+    p = sub.add_parser("activity", help="Full activity detail with laps")
+    p.add_argument("id", type=int)
+    p.set_defaults(func=cmd_activity)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
